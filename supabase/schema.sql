@@ -14,6 +14,10 @@ create table if not exists public.seances (
 
 create index if not exists seances_user_date on public.seances (user_id, date desc);
 
+-- L'appli passe par l'API Supabase : seuls les comptes connectés y ont accès.
+revoke all on public.seances from anon;
+grant select, insert, update, delete on public.seances to authenticated;
+
 -- Chaque compte ne voit et ne modifie que ses propres séances.
 alter table public.seances enable row level security;
 

@@ -28,6 +28,17 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 h1{font:700 40px/1.05 'Barlow Condensed',sans-serif;margin:0;text-wrap:balance}
 h2{font:700 24px/1.1 'Barlow Condensed',sans-serif;margin:24px 0 10px}
 .status{font-size:13px;color:var(--mute);text-align:right;flex:none;max-width:45%}
+button.status{border:0;background:none;padding:6px 0;min-height:36px;text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}
+.banner{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--soft);border-radius:14px;padding:12px 14px;margin:0 0 16px;font-size:14.5px}
+.banner p{margin:0;flex:1 1 180px}
+.acc{display:grid;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px}
+.acc p{margin:0}
+.acc .save{min-height:52px;font-size:21px;box-shadow:none}
+.acc .row{display:flex;gap:8px;flex-wrap:wrap}
+.acc .row>*{flex:1 1 140px}
+.msg{font-size:14px;color:var(--mute)}
+.msg.err{color:var(--acc)}
+.link{border:0;background:none;color:var(--acc);font-weight:600;padding:8px 0;justify-self:start}
 .lbl{display:block;font-size:13px;color:var(--mute);margin:0 0 6px;font-weight:500}
 input,select,textarea{font:inherit;font-size:16px;width:100%;min-height:46px;border:1.5px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);padding:0 12px}
 textarea{padding:10px 12px;line-height:1.4;resize:vertical;min-height:70px}
@@ -103,8 +114,9 @@ nav.tabs button.on{color:var(--acc)}
 <section id="tab-seance">
   <div class="top">
     <h1 id="formTitle">Nouvelle séance</h1>
-    <div class="status" id="status">Enregistré sur cet appareil</div>
+    <button type="button" class="status" id="status">Enregistré sur cet appareil</button>
   </div>
+  <div class="banner" id="loginBanner" hidden><p>Connecte-toi pour sauvegarder tes séances en ligne.</p><button type="button" class="mini red" id="bannerBtn">Se connecter</button></div>
   <div class="row2">
     <div><label class="lbl" for="date">Date</label><input type="date" id="date"></div>
     <div><span class="lbl">Thème de la séance</span><div class="chips" id="themes"></div></div>
@@ -130,6 +142,11 @@ nav.tabs button.on{color:var(--acc)}
   <textarea id="tsv" hidden readonly aria-label="Séances à copier"></textarea>
 </section>
 
+<section id="tab-compte" hidden>
+  <div class="top"><h1>Mon compte</h1><button type="button" class="mini" id="backBtn">Retour</button></div>
+  <div class="acc" id="accBox"></div>
+</section>
+
 <section id="tab-prog" hidden>
   <div class="top"><h1>Progrès</h1></div>
   <label class="lbl" for="exSel">Exercice ou machine</label>
@@ -147,8 +164,13 @@ nav.tabs button.on{color:var(--acc)}
 <datalist id="names"></datalist>
 <div class="toast" id="toast" role="status"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js"></script>
 <script>
 {
+/* Supabase : colle ici l'URL du projet et la clé « publishable » (ou « anon public »). Jamais la clé secrète. */
+const SUPABASE_URL="";
+const SUPABASE_KEY="";
+
 const THEMES=[["Jambes","#d4690c"],["Fesses","#c2367f"],["Dos","#13867f"],["Haut du corps","#2f6fd6"]];
 const colOf=t=>(THEMES.find(x=>x[0]===t)||[0,"#7a766f"])[1];
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -189,6 +211,10 @@ function normDraft(d){
 
 let sessions=LS.get("seances",[]).map(o=>clean(o,o.id));
 let mode="local",dbcol=null;
+/* Supabase */
+const SB_ON=!!(SUPABASE_URL&&SUPABASE_KEY);
+let sb=null,sbUser=null,syncing=false,again=false,lastSync=null,accMsg="",accErr=false,recovery=false,accKey="";
+let pending=LS.get("pending",{});if(!pending||typeof pending!=="object"||Array.isArray(pending))pending={};
 let draft=normDraft(LS.get("brouillon",null));
 let hf="Tous",progEx=LS.get("progEx",""),pendingRm=null,rmTimer=0,chartPts=[];
 
@@ -197,7 +223,15 @@ const saveDraft=()=>LS.set("brouillon",draft);
 
 let tt=0;
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>t.classList.remove("show"),2200)}
-function setStatus(m){$("#status").textContent=m||(mode==="cloud"?"Synchronisé sur ton compte":"Enregistré sur cet appareil")}
+const hhmm=d=>d.toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"});
+function setStatus(m){
+  const n=Object.keys(pending).length;
+  $("#status").textContent=m||(mode==="cloud"?"Synchronisé sur ton compte"
+    :mode==="sb"?(n?"En attente d'envoi…":lastSync?"Sauvegardé · "+hhmm(lastSync):"Connectée")
+    :SB_ON?"Non connectée":"Enregistré sur cet appareil");
+  $("#loginBanner").hidden=!(SB_ON&&sb&&!sbUser&&mode!=="cloud");
+  renderAcc();
+}
 
 function lastFor(name){
   const k=key(name);if(!k)return null;
@@ -308,16 +342,99 @@ async function persist(s){
   if(mode==="cloud"){await dbcol.doc(s.id).set(body(s));return}
   const i=sessions.findIndex(x=>x.id===s.id);if(i>=0)sessions[i]=s;else sessions.push(s);
   LS.set("seances",sessions);renderAll();
+  if(mode==="sb"){pending[s.id]="up";LS.set("pending",pending);setStatus();sync()}
 }
 async function removeS(id){
   if(mode==="cloud"){await dbcol.doc(id).delete();return}
   sessions=sessions.filter(x=>x.id!==id);LS.set("seances",sessions);renderAll();
+  if(mode==="sb"){pending[id]="del";LS.set("pending",pending);setStatus();sync()}
+}
+
+/* Sauvegarde en ligne (Supabase) : tout est d'abord enregistré sur le téléphone,
+   puis envoyé dès qu'il y a du réseau. Pratique à la salle quand ça capte mal. */
+async function sync(){
+  if(mode!=="sb"||!sb||!sbUser)return;
+  if(syncing){again=true;return}
+  syncing=true;setStatus("Synchronisation…");
+  try{
+    for(const[id,op]of Object.entries(pending)){
+      if(op==="del"){const{error}=await sb.from("seances").delete().eq("id",id);if(error)throw error}
+      else{const s=sessions.find(x=>x.id===id);if(s){const{error}=await sb.from("seances").upsert({id:s.id,...body(s)});if(error)throw error}}
+      delete pending[id];LS.set("pending",pending);
+    }
+    const{data,error}=await sb.from("seances").select("id,date,theme,note,ex,t").order("date",{ascending:false}).limit(1000);
+    if(error)throw error;
+    const server=(data||[]).map(r=>clean(r,r.id)),ids=new Set(server.map(x=>x.id));
+    const waiting=sessions.filter(x=>pending[x.id]==="up"&&!ids.has(x.id));
+    sessions=server.filter(x=>pending[x.id]!=="del").concat(waiting);
+    LS.set("seances",sessions);lastSync=new Date();renderAll();setStatus();
+  }catch(e){setStatus(navigator.onLine===false?"Hors ligne · envoi plus tard":"Synchro impossible · nouvel essai plus tard")}
+  finally{syncing=false;renderAcc();if(again){again=false;sync()}}
+}
+function startSb(){
+  if(!SB_ON||!window.supabase||typeof window.supabase.createClient!=="function")return;
+  try{sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}})}catch(e){sb=null;return}
+  sb.auth.onAuthStateChange((evt,session)=>{
+    if(evt==="PASSWORD_RECOVERY"){recovery=true;showTab("compte")}
+    const u=session?session.user:null;
+    setTimeout(()=>setUser(u),0); /* jamais d'appel Supabase directement dans ce rappel */
+  });
+}
+function setUser(u){
+  const was=sbUser?sbUser.id:null;sbUser=u;
+  if(u&&u.id!==was){
+    const owner=LS.get("sbOwner",null);
+    if(owner&&owner!==u.id){sessions=[];pending={}}
+    else if(!owner){for(const x of sessions)if(!pending[x.id])pending[x.id]="up"}
+    LS.set("sbOwner",u.id);LS.set("pending",pending);LS.set("seances",sessions);
+    mode="sb";renderAll();sync();
+  }
+  if(!u&&mode==="sb")mode="local";
+  setStatus();
+}
+async function logout(){
+  if(Object.keys(pending).length){await sync();
+    if(Object.keys(pending).length){accMsg="Certaines séances ne sont pas encore envoyées. Retrouve du réseau puis réessaie, sinon elles seraient perdues.";accErr=true;renderAcc();return}}
+  await sb.auth.signOut();
+  sessions=[];pending={};LS.set("seances",[]);LS.set("pending",{});LS.set("sbOwner",null);
+  sbUser=null;mode="local";lastSync=null;accMsg="";renderAll();setStatus();
+}
+function frErr(e){
+  const m=String(e&&e.message||"");
+  if(/invalid login/i.test(m))return"E-mail ou mot de passe incorrect.";
+  if(/not confirmed/i.test(m))return"Confirme d'abord ton e-mail (regarde dans tes mails, et les spams).";
+  if(/already registered|already exists/i.test(m))return"Ce compte existe déjà : connecte-toi.";
+  if(/password/i.test(m)&&/(short|least|characters)/i.test(m))return"Mot de passe trop court.";
+  if(/rate limit|too many/i.test(m))return"Trop d'essais, attends quelques minutes.";
+  if(/fetch|network/i.test(m))return"Pas de connexion internet.";
+  return"Erreur : "+m;
+}
+function renderAcc(){
+  const b=$("#accBox");if(!b)return;
+  const n=Object.keys(pending).length;
+  const state=mode==="cloud"?"cloud":!SB_ON?"nosb":!sb?"nolib":recovery&&sbUser?"pw":sbUser?"in":"out";
+  const key=[state,accMsg,accErr,state==="in"?[sbUser.email,sessions.length,n,lastSync&&lastSync.getTime(),syncing]:""].join("|");
+  if(key===accKey)return;accKey=key;
+  const msg=accMsg?`<p class="msg${accErr?" err":""}" role="status">${esc(accMsg)}</p>`:"";
+  if(state==="cloud"){b.innerHTML=`<p>Tes séances sont enregistrées sur ton compte Claude et synchronisées entre tes appareils.</p>`;return}
+  if(state==="nosb"){b.innerHTML=`<p>Tes séances sont enregistrées sur cet appareil uniquement.</p><p class="msg">Pour les sauvegarder en ligne, il faut renseigner l'adresse et la clé du projet Supabase en haut du script.</p>`;return}
+  if(state==="nolib"){b.innerHTML=`<p>Le service de sauvegarde n'a pas pu se charger. Vérifie ta connexion, puis ferme et rouvre l'appli.</p>`;return}
+  if(state==="pw"){b.innerHTML=`<p>Choisis ton nouveau mot de passe.</p><div><label class="lbl" for="newPw">Nouveau mot de passe</label><input type="password" id="newPw" autocomplete="new-password"></div><button type="button" class="save" data-acc="setpw">Enregistrer le mot de passe</button>${msg}`;return}
+  if(state==="in"){b.innerHTML=`<p>Connectée avec <b>${esc(sbUser.email||"")}</b></p>
+    <p class="msg">${sessions.length} séance${sessions.length>1?"s":""} · ${syncing?"synchronisation…":n?n+" en attente d'envoi":lastSync?"tout est sauvegardé ("+esc(hhmm(lastSync))+")":"synchronisation…"}</p>
+    <div class="row"><button type="button" class="save" data-acc="sync">Synchroniser</button><button type="button" class="ghost" data-acc="logout">Se déconnecter</button></div>${msg}`;return}
+  b.innerHTML=`<p>Connecte-toi pour sauvegarder tes séances et les retrouver sur tous tes appareils.</p>
+    <div><label class="lbl" for="em">E-mail</label><input type="email" id="em" autocomplete="email" inputmode="email" value="${esc(LS.get("email",""))}"></div>
+    <div><label class="lbl" for="pw">Mot de passe</label><input type="password" id="pw" autocomplete="current-password"></div>
+    <button type="button" class="save" data-acc="login">Se connecter</button>
+    <div class="row"><button type="button" class="ghost" data-acc="signup">Créer un compte</button></div>
+    <button type="button" class="link" data-acc="forgot">Mot de passe oublié ?</button>${msg}`;
 }
 
 function showTab(t){
-  for(const n of["seance","hist","prog"])$("#tab-"+n).hidden=n!==t;
+  for(const n of["seance","hist","prog","compte"])$("#tab-"+n).hidden=n!==t;
   document.querySelectorAll("nav.tabs button").forEach(b=>{const on=b.dataset.tab===t;b.classList.toggle("on",on);on?b.setAttribute("aria-current","page"):b.removeAttribute("aria-current")});
-  LS.set("onglet",t);window.scrollTo(0,0);if(t==="prog")drawChart();
+  if(t!=="compte")LS.set("onglet",t);window.scrollTo(0,0);if(t==="prog")drawChart();
 }
 
 /* Événements */
@@ -386,8 +503,47 @@ $("#copy").addEventListener("click",async()=>{
   catch(err){box.value=txt;box.hidden=false;box.focus();box.select();toast("Sélectionne le texte et copie-le")}
 });
 
+$("#status").addEventListener("click",()=>showTab("compte"));
+$("#bannerBtn").addEventListener("click",()=>showTab("compte"));
+$("#backBtn").addEventListener("click",()=>showTab(LS.get("onglet","seance")));
+window.addEventListener("online",()=>sync());
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")sync()});
+$("#accBox").addEventListener("click",async e=>{
+  const btn=e.target.closest("[data-acc]");if(!btn||!sb)return;const a=btn.dataset.acc;
+  const em=($("#em")?.value||"").trim(),pw=$("#pw")?.value||"",here=location.origin+location.pathname;
+  const say=(m,err)=>{accMsg=m;accErr=!!err;renderAcc()};
+  btn.disabled=true;
+  try{
+    if(a==="login"){
+      if(!em||!pw){say("Entre ton e-mail et ton mot de passe.",1);return}
+      LS.set("email",em);const{error}=await sb.auth.signInWithPassword({email:em,password:pw});
+      if(error){say(frErr(error),1);return}
+      say("");showTab(LS.get("onglet","seance"));toast("Connectée");
+    }else if(a==="signup"){
+      if(!em||pw.length<6){say("Entre ton e-mail et un mot de passe d'au moins 6 caractères.",1);return}
+      LS.set("email",em);const{data,error}=await sb.auth.signUp({email:em,password:pw,options:{emailRedirectTo:here}});
+      if(error){say(frErr(error),1);return}
+      say(data&&data.session?"Compte créé, tu es connectée.":"Compte créé ! Ouvre l'e-mail de confirmation, puis reviens te connecter ici.");
+    }else if(a==="forgot"){
+      if(!em){say("Entre d'abord ton e-mail.",1);return}
+      LS.set("email",em);const{error}=await sb.auth.resetPasswordForEmail(em,{redirectTo:here});
+      if(error){say(frErr(error),1);return}
+      say("E-mail envoyé : clique sur le lien pour choisir un nouveau mot de passe.");
+    }else if(a==="setpw"){
+      const np=$("#newPw")?.value||"";if(np.length<6){say("6 caractères minimum.",1);return}
+      const{error}=await sb.auth.updateUser({password:np});if(error){say(frErr(error),1);return}
+      recovery=false;say("Mot de passe changé.");
+    }else if(a==="sync"){say("");await sync()}
+    else if(a==="logout"){await logout()}
+  }catch(err){say(frErr(err),1)}
+  finally{if(btn.isConnected)btn.disabled=false}
+});
+
 /* Démarrage */
-renderForm();renderAll();showTab(LS.get("onglet","seance"));setStatus();
+renderForm();renderAll();showTab(LS.get("onglet","seance"));
+const onClaude=!!(window.claude&&typeof window.claude.use==="function");
+if(!onClaude)startSb();
+setStatus();
 
 /* Synchronisation avec ton compte, si disponible */
 (async()=>{
